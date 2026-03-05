@@ -4,6 +4,7 @@ import 'core/constants.dart';
 import 'presentation/pages/backup_page.dart';
 import 'presentation/pages/album_page.dart';
 import 'presentation/pages/home_page.dart';
+import 'presentation/pages/receive_restore_page.dart';
 import 'presentation/pages/settings_page.dart';
 import 'presentation/pages/smb_setup_page.dart';
 
@@ -24,6 +25,7 @@ class PhotoSyncApp extends StatelessWidget {
         AppRoutes.home: (_) => const HomePage(),
         AppRoutes.smbSetup: (_) => const SmbSetupPage(),
         AppRoutes.album: (_) => const AlbumPage(),
+        AppRoutes.receiveRestore: (_) => const ReceiveRestorePage(),
         AppRoutes.backup: (_) => const BackupPage(),
         AppRoutes.settings: (_) => const SettingsPage(),
       },

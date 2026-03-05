@@ -480,6 +480,14 @@ class _SettingsBottomSheetContent extends ConsumerWidget {
                 label: const Text('Open full settings'),
               ),
             ),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.icon(
+                onPressed: () => Navigator.pushNamed(context, AppRoutes.receiveRestore),
+                icon: const Icon(Icons.download_for_offline_outlined),
+                label: const Text('从NAS导入(Receive)'),
+              ),
+            ),
           ],
         );
       },

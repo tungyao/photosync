@@ -109,4 +109,26 @@ class MediaChannel {
       },
     );
   }
+
+  Future<Set<String>> findImportedByNameSize(
+    Iterable<Map<String, Object?>> entries,
+  ) async {
+    final payload = entries
+        .map(
+          (item) => <String, dynamic>{
+            'name': item['name']?.toString() ?? '',
+            'size': item['size'],
+          },
+        )
+        .where((e) => (e['name'] as String).isNotEmpty)
+        .toList(growable: false);
+    if (payload.isEmpty) return <String>{};
+
+    final result = await _channel.invokeMethod<List<dynamic>>(
+      'findImportedByNameSize',
+      <String, dynamic>{'entries': payload},
+    );
+    if (result == null) return <String>{};
+    return result.map((e) => e.toString()).toSet();
+  }
 }

@@ -743,3 +743,450 @@ final backupRunnerProvider =
     StateNotifierProvider<BackupRunnerController, BackupRunnerState>((ref) {
   return BackupRunnerController(ref);
 });
+
+enum ReceiveTaskStatus {
+  idle,
+  browsing,
+  restoring,
+  paused,
+  completed,
+  cancelled,
+  failed,
+}
+
+class RemoteBrowserState {
+  const RemoteBrowserState({
+    required this.currentDir,
+    required this.entries,
+    required this.selectedPaths,
+    required this.importedKeys,
+    required this.selectionMode,
+    required this.latestFirst,
+    required this.isLoading,
+    required this.isLoadingMore,
+    required this.hasMore,
+    this.nextCursor,
+    this.error,
+  });
+
+  final String currentDir;
+  final List<SmbRemoteEntry> entries;
+  final Set<String> selectedPaths;
+  final Set<String> importedKeys;
+  final bool selectionMode;
+  final bool latestFirst;
+  final bool isLoading;
+  final bool isLoadingMore;
+  final bool hasMore;
+  final String? nextCursor;
+  final String? error;
+
+  RemoteBrowserState copyWith({
+    String? currentDir,
+    List<SmbRemoteEntry>? entries,
+    Set<String>? selectedPaths,
+    Set<String>? importedKeys,
+    bool? selectionMode,
+    bool? latestFirst,
+    bool? isLoading,
+    bool? isLoadingMore,
+    bool? hasMore,
+    String? nextCursor,
+    String? error,
+    bool clearError = false,
+  }) {
+    return RemoteBrowserState(
+      currentDir: currentDir ?? this.currentDir,
+      entries: entries ?? this.entries,
+      selectedPaths: selectedPaths ?? this.selectedPaths,
+      importedKeys: importedKeys ?? this.importedKeys,
+      selectionMode: selectionMode ?? this.selectionMode,
+      latestFirst: latestFirst ?? this.latestFirst,
+      isLoading: isLoading ?? this.isLoading,
+      isLoadingMore: isLoadingMore ?? this.isLoadingMore,
+      hasMore: hasMore ?? this.hasMore,
+      nextCursor: nextCursor ?? this.nextCursor,
+      error: clearError ? null : (error ?? this.error),
+    );
+  }
+}
+
+class RemoteBrowserController extends StateNotifier<RemoteBrowserState> {
+  RemoteBrowserController(this.ref)
+      : super(
+          const RemoteBrowserState(
+            currentDir: '',
+            entries: <SmbRemoteEntry>[],
+            selectedPaths: <String>{},
+            importedKeys: <String>{},
+            selectionMode: false,
+            latestFirst: true,
+            isLoading: false,
+            isLoadingMore: false,
+            hasMore: true,
+          ),
+        );
+
+  final Ref ref;
+  static const int _pageSize = 200;
+
+  Future<void> loadInitial([String? dir]) async {
+    final targetDir = dir ?? state.currentDir;
+    state = state.copyWith(
+      currentDir: targetDir,
+      entries: <SmbRemoteEntry>[],
+      selectedPaths: <String>{},
+      importedKeys: <String>{},
+      selectionMode: false,
+      isLoading: true,
+      isLoadingMore: false,
+      hasMore: true,
+      nextCursor: null,
+      clearError: true,
+    );
+    await _loadPage(reset: true);
+  }
+
+  Future<void> loadMore() async {
+    if (state.isLoading || state.isLoadingMore || !state.hasMore) return;
+    await _loadPage(reset: false);
+  }
+
+  Future<void> enterDir(String path) async {
+    await loadInitial(path);
+  }
+
+  Future<void> backToParent() async {
+    if (state.currentDir.isEmpty) return;
+    final normalized =
+        state.currentDir.replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), '');
+    final idx = normalized.lastIndexOf('/');
+    final parent = idx <= 0 ? '' : normalized.substring(0, idx);
+    await loadInitial(parent);
+  }
+
+  void toggleSelect(SmbRemoteEntry entry) {
+    if (entry.isDir || !entry.isImage) return;
+    final next = {...state.selectedPaths};
+    if (next.contains(entry.path)) {
+      next.remove(entry.path);
+    } else {
+      next.add(entry.path);
+    }
+    state = state.copyWith(
+      selectedPaths: next,
+      selectionMode: next.isNotEmpty || state.selectionMode,
+    );
+  }
+
+  void longPressSelect(SmbRemoteEntry entry) {
+    if (entry.isDir || !entry.isImage) return;
+    if (!state.selectionMode) {
+      state = state.copyWith(selectionMode: true);
+    }
+    toggleSelect(entry);
+  }
+
+  void clearSelectionMode() {
+    state = state.copyWith(selectionMode: false, selectedPaths: <String>{});
+  }
+
+  void selectAllVisible() {
+    final mediaPaths = state.entries
+        .where((e) => !e.isDir && e.isImage)
+        .map((e) => e.path)
+        .toSet();
+    if (mediaPaths.isEmpty) return;
+    final next = {...state.selectedPaths};
+    final allSelected = mediaPaths.every(next.contains);
+    if (allSelected) {
+      next.removeAll(mediaPaths);
+    } else {
+      next.addAll(mediaPaths);
+    }
+    state = state.copyWith(selectedPaths: next, selectionMode: true);
+  }
+
+  Future<void> toggleLatestFirst() async {
+    state = state.copyWith(latestFirst: true);
+    await loadInitial(state.currentDir);
+  }
+
+  List<SmbRemoteEntry> selectedMediaEntries() {
+    final selected = state.selectedPaths;
+    return state.entries
+        .where((e) => !e.isDir && e.isImage && selected.contains(e.path))
+        .toList(growable: false);
+  }
+
+  Future<void> _loadPage({required bool reset}) async {
+    try {
+      state = state.copyWith(
+        isLoading: reset,
+        isLoadingMore: !reset,
+        clearError: true,
+      );
+      final config = await ref.read(smbConfigProvider.future);
+      final result = await ref.read(smbChannelProvider).listRemote(
+            config: config,
+            dir: state.currentDir,
+            limit: _pageSize,
+            cursor: reset ? null : state.nextCursor,
+            latestFirst: state.latestFirst,
+          );
+      final nextEntries = reset ? result.items : [...state.entries, ...result.items];
+      final importedKeys = await _resolveImportedKeys(nextEntries);
+      state = state.copyWith(
+        entries: nextEntries,
+        importedKeys: importedKeys,
+        nextCursor: result.nextCursor,
+        hasMore: result.hasMore,
+        isLoading: false,
+        isLoadingMore: false,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        isLoadingMore: false,
+        error: e.toString(),
+      );
+    }
+  }
+
+  Future<Set<String>> _resolveImportedKeys(List<SmbRemoteEntry> entries) async {
+    final media = entries.where((e) => !e.isDir && e.isImage).toList(growable: false);
+    if (media.isEmpty) return <String>{};
+    final payload = media
+        .map((e) => <String, Object?>{'name': e.name, 'size': e.size})
+        .toList(growable: false);
+    return ref.read(mediaChannelProvider).findImportedByNameSize(payload);
+  }
+
+  void markImported(SmbRemoteEntry entry) {
+    if (entry.isDir || !entry.isImage) return;
+    final next = {...state.importedKeys, entry.localMatchKey};
+    state = state.copyWith(importedKeys: next);
+  }
+}
+
+final remoteBrowserProvider =
+    StateNotifierProvider<RemoteBrowserController, RemoteBrowserState>((ref) {
+  return RemoteBrowserController(ref);
+});
+
+class ReceiveRunnerState {
+  const ReceiveRunnerState({
+    required this.isRunning,
+    required this.status,
+    required this.total,
+    required this.done,
+    required this.failed,
+    required this.skipped,
+    required this.currentPath,
+    required this.speedBytesPerSec,
+    required this.failedPaths,
+    this.error,
+  });
+
+  final bool isRunning;
+  final ReceiveTaskStatus status;
+  final int total;
+  final int done;
+  final int failed;
+  final int skipped;
+  final String? currentPath;
+  final double speedBytesPerSec;
+  final List<String> failedPaths;
+  final String? error;
+
+  ReceiveRunnerState copyWith({
+    bool? isRunning,
+    ReceiveTaskStatus? status,
+    int? total,
+    int? done,
+    int? failed,
+    int? skipped,
+    String? currentPath,
+    bool clearCurrentPath = false,
+    double? speedBytesPerSec,
+    List<String>? failedPaths,
+    String? error,
+    bool clearError = false,
+  }) {
+    return ReceiveRunnerState(
+      isRunning: isRunning ?? this.isRunning,
+      status: status ?? this.status,
+      total: total ?? this.total,
+      done: done ?? this.done,
+      failed: failed ?? this.failed,
+      skipped: skipped ?? this.skipped,
+      currentPath: clearCurrentPath ? null : (currentPath ?? this.currentPath),
+      speedBytesPerSec: speedBytesPerSec ?? this.speedBytesPerSec,
+      failedPaths: failedPaths ?? this.failedPaths,
+      error: clearError ? null : (error ?? this.error),
+    );
+  }
+}
+
+class ReceiveRunnerController extends StateNotifier<ReceiveRunnerState> {
+  ReceiveRunnerController(this.ref)
+      : super(
+          const ReceiveRunnerState(
+            isRunning: false,
+            status: ReceiveTaskStatus.idle,
+            total: 0,
+            done: 0,
+            failed: 0,
+            skipped: 0,
+            currentPath: null,
+            speedBytesPerSec: 0,
+            failedPaths: <String>[],
+          ),
+        );
+
+  final Ref ref;
+  bool _cancelled = false;
+  int _bytesWritten = 0;
+  int _sampleMs = 0;
+  int _sampleBytes = 0;
+  final Map<String, SmbRemoteEntry> _lastEntriesByPath = <String, SmbRemoteEntry>{};
+
+  Future<void> startRestore({
+    required List<SmbRemoteEntry> selected,
+    bool skipDuplicates = true,
+  }) async {
+    if (state.isRunning) return;
+    final mediaEntries = selected.where((e) => !e.isDir && e.isMedia).toList(growable: false);
+    if (mediaEntries.isEmpty) return;
+
+    _cancelled = false;
+    _bytesWritten = 0;
+    _sampleMs = DateTime.now().millisecondsSinceEpoch;
+    _sampleBytes = 0;
+    _lastEntriesByPath
+      ..clear()
+      ..addEntries(mediaEntries.map((e) => MapEntry(e.path, e)));
+
+    state = state.copyWith(
+      isRunning: true,
+      status: ReceiveTaskStatus.restoring,
+      total: mediaEntries.length,
+      done: 0,
+      failed: 0,
+      skipped: 0,
+      failedPaths: <String>[],
+      speedBytesPerSec: 0,
+      clearCurrentPath: true,
+      clearError: true,
+    );
+
+    try {
+      final config = await ref.read(smbConfigProvider.future);
+      final settings = await ref.read(appSettingsProvider.future);
+      final smb = ref.read(smbChannelProvider);
+      final queue = [...mediaEntries];
+      var index = 0;
+      final failedPaths = <String>[];
+      final workerCount = settings.concurrency <= 0 ? 1 : settings.concurrency;
+
+      Future<void> worker() async {
+        while (!_cancelled) {
+          if (index >= queue.length) return;
+          final entry = queue[index];
+          index += 1;
+
+          state = state.copyWith(currentPath: entry.path);
+          try {
+            final downloaded = await smb.downloadRemoteToTemp(
+              config: config,
+              remotePath: entry.path,
+            );
+            if (_cancelled) return;
+            final saved = await smb.saveTempToAlbum(
+              localPath: downloaded.localPath,
+              fileName: downloaded.fileName,
+              mimeType: downloaded.mimeType,
+              skipDuplicates: skipDuplicates,
+            );
+
+            if (saved.duplicateSkipped) {
+              state = state.copyWith(skipped: state.skipped + 1);
+              ref.read(remoteBrowserProvider.notifier).markImported(entry);
+            } else {
+              _bytesWritten += saved.bytesWritten;
+              final nowMs = DateTime.now().millisecondsSinceEpoch;
+              final dt = nowMs - _sampleMs;
+              final deltaBytes = _bytesWritten - _sampleBytes;
+              final speed = dt <= 0 ? state.speedBytesPerSec : (deltaBytes * 1000 / dt);
+              _sampleMs = nowMs;
+              _sampleBytes = _bytesWritten;
+              state = state.copyWith(
+                done: state.done + 1,
+                speedBytesPerSec: speed.toDouble(),
+              );
+              ref.read(remoteBrowserProvider.notifier).markImported(entry);
+            }
+          } catch (_) {
+            failedPaths.add(entry.path);
+            state = state.copyWith(
+              failed: state.failed + 1,
+              failedPaths: [...state.failedPaths, entry.path],
+            );
+          }
+        }
+      }
+
+      await Future.wait(List<Future<void>>.generate(workerCount, (_) => worker()));
+
+      if (_cancelled) {
+        state = state.copyWith(
+          isRunning: false,
+          status: ReceiveTaskStatus.cancelled,
+          clearCurrentPath: true,
+        );
+      } else if (failedPaths.isNotEmpty) {
+        state = state.copyWith(
+          isRunning: false,
+          status: ReceiveTaskStatus.failed,
+          clearCurrentPath: true,
+        );
+      } else {
+        state = state.copyWith(
+          isRunning: false,
+          status: ReceiveTaskStatus.completed,
+          clearCurrentPath: true,
+        );
+      }
+    } catch (e) {
+      state = state.copyWith(
+        isRunning: false,
+        status: ReceiveTaskStatus.failed,
+        error: e.toString(),
+        clearCurrentPath: true,
+      );
+    }
+  }
+
+  Future<void> retryFailed() async {
+    final retryEntries = state.failedPaths
+        .map((path) => _lastEntriesByPath[path])
+        .whereType<SmbRemoteEntry>()
+        .toList(growable: false);
+    if (retryEntries.isEmpty) return;
+    await startRestore(selected: retryEntries);
+  }
+
+  void cancel() {
+    _cancelled = true;
+    state = state.copyWith(
+      isRunning: false,
+      status: ReceiveTaskStatus.cancelled,
+      clearCurrentPath: true,
+    );
+  }
+}
+
+final receiveRunnerProvider =
+    StateNotifierProvider<ReceiveRunnerController, ReceiveRunnerState>((ref) {
+  return ReceiveRunnerController(ref);
+});

@@ -2,9 +2,11 @@ package com.example.photosync
 
 import android.Manifest
 import android.content.ContentUris
+import android.content.ContentValues
 import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.ThumbnailUtils
 import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Build
@@ -32,6 +34,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.net.URLConnection
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -105,6 +109,7 @@ class MainActivity : FlutterActivity() {
                 "listAssets" -> runIo(result) { handleListAssets(call) }
                 "exportToTempFile" -> runIo(result) { handleExportToTempFile(call) }
                 "getThumbnail" -> runIo(result) { handleGetThumbnail(call) }
+                "findImportedByNameSize" -> runIo(result) { handleFindImportedByNameSize(call) }
                 else -> result.notImplemented()
             }
         }
@@ -114,6 +119,10 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "testConnection" -> handleTestConnection(call)
                     "exists" -> handleExists(call)
+                    "listRemote" -> handleListRemote(call)
+                    "downloadRemoteToTemp" -> handleDownloadRemoteToTemp(call)
+                    "saveTempToAlbum" -> handleSaveTempToAlbum(call)
+                    "getRemoteThumbnail" -> handleGetRemoteThumbnail(call)
                     "ensureDir" -> {
                         handleEnsureDir(call)
                         null
@@ -409,6 +418,267 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun handleListRemote(call: MethodCall): Map<String, Any?> {
+        val dir = call.argument<String>("dir")?.trim().orEmpty()
+        val limit = (call.argument<Number>("limit")?.toInt() ?: 100).coerceIn(1, 300)
+        val offset = (call.argument<String>("cursor")?.toIntOrNull() ?: 0).coerceAtLeast(0)
+        val latestFirst = call.argument<Boolean>("latestFirst") ?: false
+
+        return withDiskShare(call) { _, _, share, cfg ->
+            val targetPath = buildRemotePath(cfg.baseDir, dir)
+            if (targetPath.isNotEmpty() && !share.folderExists(targetPath)) {
+                throw IllegalArgumentException("remote dir not found: $dir")
+            }
+
+            val list = share.list(targetPath)
+                .asSequence()
+                .filter { info ->
+                    val name = info.fileName
+                    name != "." && name != ".."
+                }
+                .map { info ->
+                    val name = info.fileName
+                    val relativePath = joinPathParts(dir, name)
+                    val isDir = info.fileAttributes
+                        .toString()
+                        .contains("FILE_ATTRIBUTE_DIRECTORY")
+                    val size = runCatching { info.endOfFile.toLong().coerceAtLeast(0) }.getOrDefault(0L)
+                    val modifiedMs = runCatching { info.lastWriteTime.toEpochMillis() }.getOrDefault(0L)
+                    val mime = if (isDir) "inode/directory" else guessMimeType(name)
+                    mapOf(
+                        "path" to relativePath,
+                        "name" to name,
+                        "isDir" to isDir,
+                        "size" to size,
+                        "modifiedMs" to modifiedMs,
+                        "mimeType" to mime,
+                    )
+                }
+                .sortedWith(
+                    if (latestFirst) {
+                        compareBy<Map<String, Any?>>(
+                            { !(it["isDir"] as Boolean) },
+                            { -((it["modifiedMs"] as Long)) },
+                            { (it["name"] as String).lowercase() },
+                        )
+                    } else {
+                        compareBy<Map<String, Any?>>(
+                            { !(it["isDir"] as Boolean) }, // dirs first
+                            { (it["name"] as String).lowercase() },
+                        )
+                    },
+                )
+                .toList()
+
+            val page = list.drop(offset).take(limit)
+            val hasMore = offset + page.size < list.size
+            mapOf(
+                "items" to page,
+                "nextCursor" to if (hasMore) (offset + page.size).toString() else null,
+                "hasMore" to hasMore,
+            )
+        }
+    }
+
+    private fun handleDownloadRemoteToTemp(call: MethodCall): Map<String, Any?> {
+        val remotePath = call.argument<String>("remotePath")?.trim().orEmpty()
+        if (remotePath.isEmpty()) {
+            throw IllegalArgumentException("remotePath is required")
+        }
+
+        return withDiskShare(call) { _, _, share, cfg ->
+            val fullRemotePath = buildRemotePath(cfg.baseDir, remotePath)
+            if (!share.fileExists(fullRemotePath)) {
+                throw IllegalArgumentException("remote file not found: $remotePath")
+            }
+
+            val fileName = remotePath.substringAfterLast('/').substringAfterLast('\\').ifEmpty {
+                "remote_file"
+            }
+            val safeName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val tmpDir = File(cacheDir, "restore_tmp").apply { mkdirs() }
+            val outFile = File(tmpDir, "${System.currentTimeMillis()}_$safeName")
+
+            share.openFile(
+                fullRemotePath,
+                setOf(AccessMask.FILE_READ_DATA, AccessMask.GENERIC_READ),
+                setOf(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+                setOf(SMB2ShareAccess.FILE_SHARE_READ),
+                SMB2CreateDisposition.FILE_OPEN,
+                setOf(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE),
+            ).use { smbFile ->
+                smbFile.inputStream.use { input ->
+                    FileOutputStream(outFile).use { output ->
+                        val buffer = ByteArray(256 * 1024)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                        }
+                        output.flush()
+                    }
+                }
+            }
+
+            mapOf(
+                "localPath" to outFile.absolutePath,
+                "fileName" to fileName,
+                "fileSize" to outFile.length(),
+                "mimeType" to guessMimeType(fileName),
+            )
+        }
+    }
+
+    private fun handleSaveTempToAlbum(call: MethodCall): Map<String, Any?> {
+        val localPath = call.argument<String>("localPath")?.trim().orEmpty()
+        val fileName = call.argument<String>("fileName")?.trim().orEmpty()
+        val mimeType = call.argument<String>("mimeType")?.trim().orEmpty().ifEmpty { guessMimeType(fileName) }
+        val skipDuplicates = call.argument<Boolean>("skipDuplicates") ?: true
+
+        if (!hasMediaPermission()) {
+            throw CodedException("PERMISSION_DENIED", "Media permission denied")
+        }
+        if (localPath.isEmpty() || fileName.isEmpty()) {
+            throw IllegalArgumentException("localPath and fileName are required")
+        }
+
+        val src = File(localPath)
+        if (!src.exists() || !src.isFile) {
+            throw IllegalArgumentException("localPath not found: $localPath")
+        }
+
+        val isVideo = mimeType.lowercase().startsWith("video/")
+        val collection = if (isVideo) {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+
+        if (skipDuplicates && hasDuplicateInMediaStore(collection, fileName, src.length())) {
+            return mapOf(
+                "assetId" to null,
+                "duplicateSkipped" to true,
+                "bytesWritten" to 0,
+            )
+        }
+
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(MediaStore.MediaColumns.SIZE, src.length())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, if (isVideo) "Movies/PhotoSync" else "Pictures/PhotoSync")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+
+        val inserted = contentResolver.insert(collection, values)
+            ?: throw CodedException("NATIVE_ERROR", "Failed to create MediaStore record")
+
+        var bytesWritten = 0L
+        try {
+            FileInputStream(src).use { input ->
+                contentResolver.openOutputStream(inserted)?.use { output ->
+                    val buffer = ByteArray(256 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                        bytesWritten += read
+                    }
+                    output.flush()
+                } ?: throw CodedException("NATIVE_ERROR", "Failed to open MediaStore output stream")
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val doneValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                contentResolver.update(inserted, doneValues, null, null)
+            }
+        } catch (e: IOException) {
+            contentResolver.delete(inserted, null, null)
+            if (e.message?.contains("No space", ignoreCase = true) == true) {
+                throw CodedException("NO_SPACE", "Insufficient storage")
+            }
+            throw e
+        }
+
+        return mapOf(
+            "assetId" to inserted.toString(),
+            "duplicateSkipped" to false,
+            "bytesWritten" to bytesWritten,
+        )
+    }
+
+    private fun handleGetRemoteThumbnail(call: MethodCall): ByteArray {
+        val remotePath = call.argument<String>("remotePath")?.trim().orEmpty()
+        if (remotePath.isEmpty()) throw IllegalArgumentException("remotePath is required")
+        val width = (call.argument<Number>("width")?.toInt() ?: 200).coerceAtLeast(64)
+        val height = (call.argument<Number>("height")?.toInt() ?: 200).coerceAtLeast(64)
+
+        return withDiskShare(call) { _, _, share, cfg ->
+            val fullRemotePath = buildRemotePath(cfg.baseDir, remotePath)
+            if (!share.fileExists(fullRemotePath)) {
+                throw IllegalArgumentException("remote file not found: $remotePath")
+            }
+            val fileName = remotePath.substringAfterLast('/').substringAfterLast('\\')
+            val mime = guessMimeType(fileName).lowercase()
+            val tmpDir = File(cacheDir, "remote_thumb").apply { mkdirs() }
+            val tempFile = File(tmpDir, "${System.currentTimeMillis()}_${fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
+
+            share.openFile(
+                fullRemotePath,
+                setOf(AccessMask.FILE_READ_DATA, AccessMask.GENERIC_READ),
+                setOf(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+                setOf(SMB2ShareAccess.FILE_SHARE_READ),
+                SMB2CreateDisposition.FILE_OPEN,
+                setOf(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE),
+            ).use { smbFile ->
+                smbFile.inputStream.use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        val buffer = ByteArray(128 * 1024)
+                        while (true) {
+                            val n = input.read(buffer)
+                            if (n <= 0) break
+                            output.write(buffer, 0, n)
+                        }
+                        output.flush()
+                    }
+                }
+            }
+
+            val bitmap = if (mime.startsWith("video/")) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ThumbnailUtils.createVideoThumbnail(
+                        tempFile,
+                        Size(width, height),
+                        null,
+                    )
+                } else {
+                    ThumbnailUtils.createVideoThumbnail(
+                        tempFile.absolutePath,
+                        MediaStore.Images.Thumbnails.MINI_KIND,
+                    )
+                }
+            } else {
+                BitmapFactory.decodeFile(
+                    tempFile.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = 1 },
+                )
+            } ?: throw IllegalStateException("Failed to decode remote thumbnail")
+
+            try {
+                ByteArrayOutputStream().use { output ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 80, output)
+                    output.toByteArray()
+                }
+            } finally {
+                tempFile.delete()
+            }
+        }
+    }
+
     private fun handleGetThumbnail(call: MethodCall): ByteArray {
         val assetId = call.argument<String>("assetId")?.trim().orEmpty()
         if (assetId.isEmpty()) {
@@ -444,6 +714,36 @@ class MainActivity : FlutterActivity() {
             bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)
             return output.toByteArray()
         }
+    }
+
+    private fun handleFindImportedByNameSize(call: MethodCall): List<String> {
+        val rawEntries = call.argument<List<Map<String, Any?>>>("entries") ?: emptyList()
+        if (rawEntries.isEmpty()) return emptyList()
+
+        val matches = mutableSetOf<String>()
+        val imageUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+
+        fun queryUri(uri: Uri, fileName: String, size: Long): Boolean {
+            val projection = arrayOf(MediaStore.MediaColumns._ID)
+            val selection =
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.SIZE} = ?"
+            val args = arrayOf(fileName, size.toString())
+            contentResolver.query(uri, projection, selection, args, null)?.use { cursor ->
+                return cursor.moveToFirst()
+            }
+            return false
+        }
+
+        for (entry in rawEntries) {
+            val fileName = (entry["name"] as? String)?.trim().orEmpty()
+            val size = (entry["size"] as? Number)?.toLong() ?: 0L
+            if (fileName.isEmpty() || size <= 0) continue
+            if (queryUri(imageUri, fileName, size) || queryUri(videoUri, fileName, size)) {
+                matches.add("$fileName|$size")
+            }
+        }
+        return matches.toList()
     }
 
     private fun resolveAssetContentUri(id: Long): Uri {
@@ -625,6 +925,41 @@ class MainActivity : FlutterActivity() {
         return parts.joinToString("/")
     }
 
+    private fun hasDuplicateInMediaStore(uri: Uri, fileName: String, size: Long): Boolean {
+        val projection = arrayOf(
+            MediaStore.MediaColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.SIZE,
+        )
+        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.SIZE} = ?"
+        val args = arrayOf(fileName, size.toString())
+        contentResolver.query(uri, projection, selection, args, null)?.use { cursor ->
+            return cursor.moveToFirst()
+        }
+        return false
+    }
+
+    private fun guessMimeType(fileName: String): String {
+        val guessed = URLConnection.guessContentTypeFromName(fileName)
+        if (!guessed.isNullOrBlank()) return guessed
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "heic" -> "image/heic"
+            "webp" -> "image/webp"
+            "mp4" -> "video/mp4"
+            "mov" -> "video/quicktime"
+            "mkv" -> "video/x-matroska"
+            "avi" -> "video/x-msvideo"
+            else -> "application/octet-stream"
+        }
+    }
+
+    private class CodedException(val code: String, override val message: String) :
+        RuntimeException(message)
+
     private fun <T> withDiskShare(call: MethodCall, block: (SMBClient, com.hierynomus.smbj.connection.Connection, DiskShare, SmbConfig) -> T): T {
         val cfg = parseSmbConfig(call)
 
@@ -662,6 +997,19 @@ class MainActivity : FlutterActivity() {
             try {
                 val value = action()
                 mainHandler.post { result.success(value) }
+            } catch (e: CodedException) {
+                mainHandler.post { result.error(e.code, e.message, null) }
+            } catch (e: IOException) {
+                val code = if (e.message?.contains("No space", ignoreCase = true) == true) {
+                    "NO_SPACE"
+                } else {
+                    "NATIVE_ERROR"
+                }
+                mainHandler.post { result.error(code, e.message, null) }
+            } catch (e: SMBApiException) {
+                mainHandler.post { result.error("NETWORK_ERROR", e.message, e.stackTraceToString()) }
+            } catch (e: SecurityException) {
+                mainHandler.post { result.error("PERMISSION_DENIED", e.message, null) }
             } catch (e: UnsupportedOperationException) {
                 mainHandler.post { result.notImplemented() }
             } catch (e: IllegalArgumentException) {
