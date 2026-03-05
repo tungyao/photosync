@@ -14,18 +14,34 @@ class HomePage extends StatelessWidget {
         children: [
           Card(
             child: ListTile(
-              title: const Text('1. 选择照片'),
-              subtitle: const Text('浏览手机相册并选择需要备份的媒体'),
+              title: const Text('SMB 配置'),
+              subtitle: const Text('配置 NAS 地址、账号、共享目录'),
               trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.pushNamed(context, AppRoutes.selection),
+              onTap: () => Navigator.pushNamed(context, AppRoutes.smbSetup),
             ),
           ),
           Card(
             child: ListTile(
-              title: const Text('2. 执行增量备份'),
-              subtitle: const Text('仅上传新增或修改过的文件到 NAS'),
+              title: const Text('相册浏览'),
+              subtitle: const Text('网格分页加载，支持多选与全选'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.pushNamed(context, AppRoutes.album),
+            ),
+          ),
+          Card(
+            child: ListTile(
+              title: const Text('备份任务'),
+              subtitle: const Text('选择模式、起始时间并执行备份'),
               trailing: const Icon(Icons.chevron_right),
               onTap: () => Navigator.pushNamed(context, AppRoutes.backup),
+            ),
+          ),
+          Card(
+            child: ListTile(
+              title: const Text('设置'),
+              subtitle: const Text('并发数与远端存在跳过策略'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.pushNamed(context, AppRoutes.settings),
             ),
           ),
         ],

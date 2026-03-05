@@ -1,12 +1,14 @@
 class AppRoutes {
   static const home = '/';
-  static const selection = '/selection';
+  static const smbSetup = '/smb-setup';
+  static const album = '/album';
   static const backup = '/backup';
+  static const settings = '/settings';
 }
 
 class AppConstants {
   static const appName = 'PhotoSync';
   static const databaseName = 'photosync.sqlite';
-  static const galleryChannel = 'photosync/gallery';
-  static const smbChannel = 'photosync/smb';
+  static const mediaChannel = 'app.media';
+  static const smbChannel = 'app.smb';
 }
