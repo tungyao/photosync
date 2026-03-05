@@ -2,6 +2,7 @@ package com.example.photosync
 
 import android.Manifest
 import android.content.ContentUris
+import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -24,6 +25,7 @@ import com.hierynomus.smbj.auth.AuthenticationContext
 import com.hierynomus.smbj.share.DiskShare
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
@@ -37,23 +39,65 @@ class MainActivity : FlutterActivity() {
 
     private companion object {
         const val MEDIA_CHANNEL = "app.media"
+        const val MEDIA_CHANGES_CHANNEL = "app.mediaChanges"
         const val SMB_CHANNEL = "app.smb"
         const val REQ_MEDIA_PERMISSION = 8801
     }
 
     private lateinit var mediaChannel: MethodChannel
+    private lateinit var mediaChangesChannel: EventChannel
     private lateinit var smbChannel: MethodChannel
 
     private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var pendingPermissionResult: MethodChannel.Result? = null
+    private var mediaChangesSink: EventChannel.EventSink? = null
+    private var mediaObserverRegistered = false
+    private var pendingChangeReason: String = "unknown"
+    private var pendingChangedAfterMs: Long = 0L
+    private val mediaChangesDebounceMs = 350L
+    private val emitMediaChangeRunnable = Runnable { emitLibraryChangedNow() }
+    private val mediaObserver by lazy {
+        object : ContentObserver(mainHandler) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                super.onChange(selfChange, uri)
+                val reason = when {
+                    uri == null -> "unknown"
+                    uri.toString().contains("/images", ignoreCase = true) -> "insert"
+                    uri.toString().contains("/video", ignoreCase = true) -> "insert"
+                    else -> "unknown"
+                }
+                scheduleLibraryChanged(reason)
+            }
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
         mediaChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_CHANNEL)
+        mediaChangesChannel =
+            EventChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_CHANGES_CHANNEL)
         smbChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SMB_CHANNEL)
+        mediaChangesChannel.setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    mediaChangesSink = events
+                    if (!hasMediaPermission()) {
+                        // Keep stream open. Observer will be registered once permission is granted.
+                        return
+                    }
+                    registerMediaObservers()
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    mediaChangesSink = null
+                    unregisterMediaObservers()
+                    mainHandler.removeCallbacks(emitMediaChangeRunnable)
+                }
+            },
+        )
 
         mediaChannel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -88,7 +132,10 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         mediaChannel.setMethodCallHandler(null)
+        mediaChangesChannel.setStreamHandler(null)
         smbChannel.setMethodCallHandler(null)
+        unregisterMediaObservers()
+        mainHandler.removeCallbacks(emitMediaChangeRunnable)
         ioExecutor.shutdown()
         super.onDestroy()
     }
@@ -104,6 +151,9 @@ class MainActivity : FlutterActivity() {
         val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
         pendingPermissionResult?.success(granted)
         pendingPermissionResult = null
+        if (granted) {
+            registerMediaObservers()
+        }
     }
 
     private fun handleRequestPermission(result: MethodChannel.Result) {
@@ -133,6 +183,46 @@ class MainActivity : FlutterActivity() {
         } else {
             arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
+    }
+
+    private fun registerMediaObservers() {
+        if (mediaObserverRegistered || mediaChangesSink == null || !hasMediaPermission()) return
+        contentResolver.registerContentObserver(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            true,
+            mediaObserver,
+        )
+        contentResolver.registerContentObserver(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            true,
+            mediaObserver,
+        )
+        mediaObserverRegistered = true
+    }
+
+    private fun unregisterMediaObservers() {
+        if (!mediaObserverRegistered) return
+        contentResolver.unregisterContentObserver(mediaObserver)
+        mediaObserverRegistered = false
+    }
+
+    private fun scheduleLibraryChanged(reason: String) {
+        pendingChangeReason = reason
+        pendingChangedAfterMs = System.currentTimeMillis() - 2_000
+        mainHandler.removeCallbacks(emitMediaChangeRunnable)
+        mainHandler.postDelayed(emitMediaChangeRunnable, mediaChangesDebounceMs)
+    }
+
+    private fun emitLibraryChangedNow() {
+        val sink = mediaChangesSink ?: return
+        sink.success(
+            mapOf(
+                "type" to "libraryChanged",
+                "reason" to pendingChangeReason,
+                "changedAfterMs" to pendingChangedAfterMs,
+                "timestampMs" to System.currentTimeMillis(),
+            ),
+        )
     }
 
     private fun handleListAssets(call: MethodCall): Map<String, Any?> {

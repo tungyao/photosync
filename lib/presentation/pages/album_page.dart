@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/constants.dart';
 import '../../data/models/backup_job.dart';
 import '../../data/models/media_asset.dart';
+import '../../platform/channels/media_changes_channel.dart';
 import '../controllers/app_state_controller.dart';
 
 class AlbumPage extends HomeAlbumPage {
@@ -25,6 +26,10 @@ class _HomeAlbumPageState extends ConsumerState<HomeAlbumPage> {
   final List<List<MediaAsset>> _chunks = <List<MediaAsset>>[];
   int _loadedCount = 0;
   StreamSubscription<List<MediaAsset>>? _assetsSub;
+  StreamSubscription<List<MediaAsset>>? _prependSub;
+  StreamSubscription<MediaLibraryChangeEvent>? _mediaChangesSub;
+  Timer? _changesDebounce;
+  MediaLibraryChangeEvent? _latestChangeEvent;
 
   @override
   void initState() {
@@ -42,16 +47,56 @@ class _HomeAlbumPageState extends ConsumerState<HomeAlbumPage> {
         _loadedCount += chunk.length;
       });
     });
-    Future.microtask(controller.loadInitial);
+    _prependSub = controller.prependStream.listen((inserted) {
+      if (!mounted || inserted.isEmpty) return;
+      setState(() {
+        if (_chunks.isEmpty) {
+          _chunks.add(inserted);
+        } else {
+          _chunks[0] = [...inserted, ..._chunks[0]];
+        }
+        _loadedCount += inserted.length;
+      });
+    });
+    Future.microtask(() async {
+      await controller.loadInitial();
+      if (!mounted) return;
+      _subscribeMediaChanges();
+    });
     _scrollController.addListener(_onScroll);
   }
 
   @override
   void dispose() {
     _assetsSub?.cancel();
+    _prependSub?.cancel();
+    _mediaChangesSub?.cancel();
+    _changesDebounce?.cancel();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _onLibraryChanged(MediaLibraryChangeEvent event) {
+    _latestChangeEvent = event;
+    _changesDebounce?.cancel();
+    _changesDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (!mounted) return;
+      final latest = _latestChangeEvent;
+      ref
+          .read(albumControllerProvider.notifier)
+          .refreshFirstPageIncremental(changedAfterMs: latest?.changedAfterMs);
+    });
+  }
+
+  void _subscribeMediaChanges() {
+    if (_mediaChangesSub != null) return;
+    _mediaChangesSub = ref
+        .read(mediaChangesChannelProvider)
+        .changes()
+        .listen(_onLibraryChanged, onError: (_) {
+      // Keep pull-to-refresh as fallback if stream is unavailable.
+    });
   }
 
   void _onScroll() {

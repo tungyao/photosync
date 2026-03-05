@@ -9,6 +9,7 @@ import '../../data/models/backup_job.dart';
 import '../../data/models/media_asset.dart';
 import '../../data/models/smb_config.dart';
 import '../../domain/services/backup_engine.dart';
+import '../../platform/channels/media_changes_channel.dart';
 import '../../platform/channels/media_channel.dart';
 import '../../platform/channels/smb_channel.dart';
 import 'thumbnail_lru_cache.dart';
@@ -118,6 +119,10 @@ final backupDaoProvider = Provider<BackupDao>((ref) {
 
 final mediaChannelProvider = Provider<MediaChannel>((ref) {
   return MediaChannel();
+});
+
+final mediaChangesChannelProvider = Provider<MediaChangesChannel>((ref) {
+  return MediaChangesChannel();
 });
 
 final smbChannelProvider = Provider<SmbChannel>((ref) {
@@ -290,6 +295,7 @@ class AlbumController extends StateNotifier<AlbumState> {
           ),
         ) {
     _assetsStreamController = StreamController<List<MediaAsset>>.broadcast();
+    _prependStreamController = StreamController<List<MediaAsset>>.broadcast();
   }
 
   final Ref ref;
@@ -299,9 +305,11 @@ class AlbumController extends StateNotifier<AlbumState> {
   static const int _pageSize = 120;
   static const int _thumbPrefetchCount = 24;
   late final StreamController<List<MediaAsset>> _assetsStreamController;
+  late final StreamController<List<MediaAsset>> _prependStreamController;
   final List<List<MediaAsset>> _pages = <List<MediaAsset>>[];
 
   Stream<List<MediaAsset>> get assetsStream => _assetsStreamController.stream;
+  Stream<List<MediaAsset>> get prependStream => _prependStreamController.stream;
 
   Future<void> loadInitial() async {
     final granted = await _mediaChannel.requestPermission();
@@ -412,6 +420,53 @@ class AlbumController extends StateNotifier<AlbumState> {
     }
   }
 
+  Future<void> refreshFirstPageIncremental({int? changedAfterMs}) async {
+    if (state.isLoading) return;
+    try {
+      final page = await _mediaChannel.listAssets(
+        startTimeMs: 0,
+        limit: _pageSize,
+        cursor: '0',
+        ascending: false,
+      );
+      final firstPage = page.items
+          .map(_toMediaAsset)
+          .whereType<MediaAsset>()
+          .toList(growable: false);
+      if (firstPage.isEmpty) return;
+
+      final existingIds = _pages.expand((chunk) => chunk).map((item) => item.id).toSet();
+      final newItems = firstPage
+          .where((item) => !existingIds.contains(item.id))
+          .toList(growable: false);
+
+      unawaited(
+        ref
+            .read(syncedIdsControllerProvider.notifier)
+            .resolveForPage(firstPage.map((item) => item.id)),
+      );
+
+      if (newItems.isEmpty) return;
+
+      if (_pages.isEmpty) {
+        _pages.add(newItems);
+      } else {
+        _pages[0] = [...newItems, ..._pages[0]];
+      }
+
+      if (!_prependStreamController.isClosed) {
+        _prependStreamController.add(newItems);
+      }
+
+      _prefetchThumbnails(newItems);
+      state = state.copyWith(
+        loadedCount: _pages.fold<int>(0, (sum, chunk) => sum + chunk.length),
+      );
+    } catch (_) {
+      // Keep pull-to-refresh as fallback if event refresh fails.
+    }
+  }
+
   void _prefetchThumbnails(List<MediaAsset> assets) {
     if (assets.isEmpty) return;
     for (final asset in assets.take(_thumbPrefetchCount)) {
@@ -455,6 +510,7 @@ class AlbumController extends StateNotifier<AlbumState> {
   @override
   void dispose() {
     _assetsStreamController.close();
+    _prependStreamController.close();
     super.dispose();
   }
 }

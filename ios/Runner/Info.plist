@@ -53,6 +53,10 @@
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
 	<string>Main</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>PhotoSync needs photo library access to back up and detect new media.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>PhotoSync needs access to save and manage synced media metadata.</string>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
