@@ -24,15 +24,15 @@ class CheckpointRepositoryImpl implements CheckpointRepository {
 
   @override
   Future<List<BackupCheckpoint>> loadCheckpoints() async {
-    final rows = await _db.select(_db.backupItems).get();
+    final rows = await _db.select(_db.backupRecords).get();
     return rows
         .map(
           (row) => BackupCheckpoint(
             assetId: row.assetId,
-            localPath: row.localPath,
+            localPath: '',
             remotePath: row.remotePath,
-            modifiedAt: row.modifiedAt,
-            syncedAt: row.syncedAt,
+            modifiedAt: DateTime.fromMillisecondsSinceEpoch(row.uploadedAt),
+            syncedAt: DateTime.fromMillisecondsSinceEpoch(row.uploadedAt),
           ),
         )
         .toList();
@@ -40,13 +40,13 @@ class CheckpointRepositoryImpl implements CheckpointRepository {
 
   @override
   Future<void> upsertCheckpoint(BackupCheckpoint checkpoint) {
-    return _db.into(_db.backupItems).insertOnConflictUpdate(
-          BackupItemsCompanion(
+    return _db.into(_db.backupRecords).insertOnConflictUpdate(
+          BackupRecordsCompanion(
             assetId: Value(checkpoint.assetId),
-            localPath: Value(checkpoint.localPath),
             remotePath: Value(checkpoint.remotePath),
-            modifiedAt: Value(checkpoint.modifiedAt),
-            syncedAt: Value(checkpoint.syncedAt),
+            uploadedAt: Value(checkpoint.syncedAt.millisecondsSinceEpoch),
+            size: const Value(0),
+            sha1: const Value(''),
           ),
         );
   }

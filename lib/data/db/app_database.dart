@@ -7,28 +7,29 @@ import 'package:path_provider/path_provider.dart';
 
 import '../../core/constants.dart';
 
+part 'backup_dao.dart';
 part 'app_database.g.dart';
 
-class BackupItems extends Table {
+class BackupRecords extends Table {
   TextColumn get assetId => text()();
-  TextColumn get localPath => text()();
   TextColumn get remotePath => text()();
-  DateTimeColumn get modifiedAt => dateTime()();
-  DateTimeColumn get syncedAt => dateTime()();
+  IntColumn get uploadedAt => integer()();
+  IntColumn get size => integer()();
+  TextColumn get sha1 => text()();
 
   @override
   Set<Column<Object>> get primaryKey => {assetId};
 }
 
-class UploadSessions extends Table {
-  IntColumn get id => integer().autoIncrement()();
-  TextColumn get assetId => text()();
-  IntColumn get uploadedBytes => integer().withDefault(const Constant(0))();
-  BoolColumn get completed => boolean().withDefault(const Constant(false))();
-  DateTimeColumn get updatedAt => dateTime()();
+class Settings extends Table {
+  TextColumn get key => text()();
+  TextColumn get value => text()();
+
+  @override
+  Set<Column<Object>> get primaryKey => {key};
 }
 
-@DriftDatabase(tables: [BackupItems, UploadSessions])
+@DriftDatabase(tables: [BackupRecords, Settings], daos: [BackupDao])
 class AppDatabase extends _$AppDatabase {
   AppDatabase() : super(_openConnection());
 

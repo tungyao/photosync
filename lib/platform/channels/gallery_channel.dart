@@ -24,10 +24,13 @@ class GalleryChannel {
         all.add(
           MediaAsset(
             id: asset.id,
-            path: file.path,
-            type: asset.type.name,
-            modifiedAt: asset.modifiedDateTime,
-            size: await file.length(),
+            createTimeMs: asset.createDateTime.millisecondsSinceEpoch,
+            mimeType: asset.mimeType ?? '',
+            mediaType: asset.type.name,
+            width: asset.width,
+            height: asset.height,
+            durationMs: asset.duration * 1000,
+            fileSize: await file.length(),
           ),
         );
       }
