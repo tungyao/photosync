@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/models/smb_config.dart';
@@ -35,7 +35,7 @@ class _SmbSetupPageState extends ConsumerState<SmbSetupPage> {
     final notifier = ref.read(smbConfigProvider.notifier);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('SMB 配置')),
+      appBar: AppBar(title: const Text('SMB Setup')),
       body: configState.when(
         data: (cfg) {
           _syncTextControllers(cfg);
@@ -47,13 +47,13 @@ class _SmbSetupPageState extends ConsumerState<SmbSetupPage> {
                 TextFormField(
                   controller: _hostCtrl,
                   decoration: const InputDecoration(labelText: 'host'),
-                  validator: (v) => (v == null || v.isEmpty) ? '必填' : null,
+                  validator: (v) => (v == null || v.isEmpty) ? 'Required' : null,
                 ),
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _shareCtrl,
                   decoration: const InputDecoration(labelText: 'share'),
-                  validator: (v) => (v == null || v.isEmpty) ? '必填' : null,
+                  validator: (v) => (v == null || v.isEmpty) ? 'Required' : null,
                 ),
                 const SizedBox(height: 12),
                 TextFormField(
@@ -70,38 +70,38 @@ class _SmbSetupPageState extends ConsumerState<SmbSetupPage> {
                 TextFormField(
                   controller: _baseDirCtrl,
                   decoration: const InputDecoration(labelText: 'baseDir'),
-                  validator: (v) => (v == null || v.isEmpty) ? '必填' : null,
+                  validator: (v) => (v == null || v.isEmpty) ? 'Required' : null,
                 ),
                 const SizedBox(height: 20),
                 FilledButton.tonal(
                   onPressed: () async {
                     if (!_validateAndUpdate(notifier, cfg)) return;
                     final ok = await notifier.testConnection();
-                    if (!mounted) return;
+                    if (!context.mounted) return;
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(ok ? '连接成功' : '连接失败')),
+                      SnackBar(content: Text(ok ? 'Connection succeeded' : 'Connection failed')),
                     );
                   },
-                  child: const Text('测试连接'),
+                  child: const Text('Test connection'),
                 ),
                 const SizedBox(height: 12),
                 FilledButton(
                   onPressed: () async {
                     if (!_validateAndUpdate(notifier, cfg)) return;
                     await notifier.save();
-                    if (!mounted) return;
+                    if (!context.mounted) return;
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('配置已保存')),
+                      const SnackBar(content: Text('Config saved')),
                     );
                   },
-                  child: const Text('保存配置'),
+                  child: const Text('Save config'),
                 ),
               ],
             ),
           );
         },
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => Center(child: Text('加载失败: $e')),
+        error: (e, _) => Center(child: Text('Load failed: $e')),
       ),
     );
   }
@@ -117,7 +117,7 @@ class _SmbSetupPageState extends ConsumerState<SmbSetupPage> {
   bool _validateAndUpdate(SmbConfigController notifier, SmbConfig old) {
     final valid = _formKey.currentState?.validate() ?? false;
     if (!valid) return false;
-    notifier.update(
+    notifier.setConfig(
       old.copyWith(
         host: _hostCtrl.text.trim(),
         share: _shareCtrl.text.trim(),

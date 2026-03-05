@@ -1,14 +1,17 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../data/db/app_database.dart';
 import '../../data/db/database_provider.dart';
 import '../../data/models/backup_job.dart';
+import '../../data/models/media_asset.dart';
 import '../../data/models/smb_config.dart';
 import '../../domain/services/backup_engine.dart';
 import '../../platform/channels/media_channel.dart';
 import '../../platform/channels/smb_channel.dart';
+import 'thumbnail_lru_cache.dart';
 
 const _kHost = 'smb.host';
 const _kPort = 'smb.port';
@@ -82,7 +85,7 @@ class SmbConfigController extends AsyncNotifier<SmbConfig> {
     );
   }
 
-  void update(SmbConfig config) {
+  void setConfig(SmbConfig config) {
     state = AsyncData(config);
   }
 
@@ -142,82 +145,104 @@ final appSettingsProvider =
   AppSettingsController.new,
 );
 
-class AlbumItem {
-  const AlbumItem({
-    required this.id,
-    required this.mimeType,
-    required this.mediaType,
-    required this.createTimeMs,
-  });
-
-  final String id;
-  final String mimeType;
-  final String mediaType;
-  final int createTimeMs;
-}
-
 class AlbumState {
   const AlbumState({
-    required this.items,
     required this.selectedIds,
     required this.isLoading,
     required this.isLoadingMore,
     required this.hasMore,
+    required this.loadedCount,
     this.nextCursor,
     this.error,
   });
 
-  final List<AlbumItem> items;
   final Set<String> selectedIds;
   final bool isLoading;
   final bool isLoadingMore;
   final bool hasMore;
+  final int loadedCount;
   final String? nextCursor;
   final String? error;
 
   AlbumState copyWith({
-    List<AlbumItem>? items,
     Set<String>? selectedIds,
     bool? isLoading,
     bool? isLoadingMore,
     bool? hasMore,
+    int? loadedCount,
     String? nextCursor,
     String? error,
     bool clearError = false,
   }) {
     return AlbumState(
-      items: items ?? this.items,
       selectedIds: selectedIds ?? this.selectedIds,
       isLoading: isLoading ?? this.isLoading,
       isLoadingMore: isLoadingMore ?? this.isLoadingMore,
       hasMore: hasMore ?? this.hasMore,
+      loadedCount: loadedCount ?? this.loadedCount,
       nextCursor: nextCursor ?? this.nextCursor,
       error: clearError ? null : (error ?? this.error),
     );
   }
 }
 
+final thumbnailCacheProvider = Provider<ThumbnailLruCache>((ref) {
+  final cache = ThumbnailLruCache(maxEntries: 300);
+  ref.onDispose(cache.clear);
+  return cache;
+});
+
 class AlbumController extends StateNotifier<AlbumState> {
-  AlbumController(this._mediaChannel)
+  AlbumController(this._mediaChannel, this._thumbnailCache)
       : super(
           const AlbumState(
-            items: <AlbumItem>[],
             selectedIds: <String>{},
             isLoading: false,
             isLoadingMore: false,
             hasMore: true,
+            loadedCount: 0,
           ),
-        );
+        ) {
+    _assetsStreamController = StreamController<List<MediaAsset>>.broadcast();
+  }
 
   final MediaChannel _mediaChannel;
+  final ThumbnailLruCache _thumbnailCache;
+  static const int _thumbSize = 256;
   static const int _pageSize = 120;
+  static const int _thumbPrefetchCount = 24;
+  late final StreamController<List<MediaAsset>> _assetsStreamController;
+  final List<List<MediaAsset>> _pages = <List<MediaAsset>>[];
+
+  Stream<List<MediaAsset>> get assetsStream => _assetsStreamController.stream;
 
   Future<void> loadInitial() async {
+    final granted = await _mediaChannel.requestPermission();
+    if (!granted) {
+      _pages.clear();
+      if (!_assetsStreamController.isClosed) {
+        _assetsStreamController.add(const <MediaAsset>[]);
+      }
+      state = state.copyWith(
+        isLoading: false,
+        isLoadingMore: false,
+        hasMore: false,
+        loadedCount: 0,
+        nextCursor: null,
+        error: 'Media permission denied',
+      );
+      return;
+    }
+
+    _pages.clear();
+    if (!_assetsStreamController.isClosed) {
+      _assetsStreamController.add(const <MediaAsset>[]);
+    }
     state = state.copyWith(
       isLoading: true,
       hasMore: true,
+      loadedCount: 0,
       nextCursor: null,
-      items: <AlbumItem>[],
       clearError: true,
     );
     await _loadPage(reset: true);
@@ -239,7 +264,7 @@ class AlbumController extends StateNotifier<AlbumState> {
   }
 
   void selectAll() {
-    final visible = state.items.map((e) => e.id).toSet();
+    final visible = _pages.expand((e) => e).map((e) => e.id).toSet();
     final next = {...state.selectedIds};
     final allSelected = visible.isNotEmpty && visible.every(next.contains);
     if (allSelected) {
@@ -263,12 +288,23 @@ class AlbumController extends StateNotifier<AlbumState> {
         ascending: false,
       );
       final parsed = page.items
-          .map(_toAlbumItem)
-          .whereType<AlbumItem>()
+          .map(_toMediaAsset)
+          .whereType<MediaAsset>()
           .toList(growable: false);
 
+      if (reset) {
+        _pages.clear();
+      }
+      if (parsed.isNotEmpty) {
+        _pages.add(parsed);
+        if (!_assetsStreamController.isClosed) {
+          _assetsStreamController.add(parsed);
+        }
+      }
+      _prefetchThumbnails(parsed);
+
       state = state.copyWith(
-        items: reset ? parsed : [...state.items, ...parsed],
+        loadedCount: _pages.fold<int>(0, (sum, page) => sum + page.length),
         nextCursor: page.nextCursor,
         hasMore: page.hasMore,
         isLoading: false,
@@ -283,7 +319,25 @@ class AlbumController extends StateNotifier<AlbumState> {
     }
   }
 
-  AlbumItem? _toAlbumItem(Map<String, dynamic> raw) {
+  void _prefetchThumbnails(List<MediaAsset> assets) {
+    if (assets.isEmpty) return;
+    for (final asset in assets.take(_thumbPrefetchCount)) {
+      unawaited(loadThumbnail(asset.id));
+    }
+  }
+
+  Future<Uint8List?> loadThumbnail(String assetId) {
+    return _thumbnailCache.getOrLoad(
+      assetId,
+      () => _mediaChannel.getThumbnail(
+        assetId: assetId,
+        width: _thumbSize,
+        height: _thumbSize,
+      ),
+    );
+  }
+
+  MediaAsset? _toMediaAsset(Map<String, dynamic> raw) {
     final id = raw['id']?.toString();
     if (id == null || id.isEmpty) return null;
 
@@ -293,18 +347,31 @@ class AlbumController extends StateNotifier<AlbumState> {
       return int.tryParse(v?.toString() ?? '') ?? 0;
     }
 
-    return AlbumItem(
+    return MediaAsset(
       id: id,
       mimeType: raw['mimeType']?.toString() ?? '',
       mediaType: raw['mediaType']?.toString() ?? '',
-      createTimeMs: toInt(raw['createTimeMs']),
+      createTimeMs: toInt(raw['dateTakenMs']),
+      width: toInt(raw['width']),
+      height: toInt(raw['height']),
+      durationMs: toInt(raw['durationMs']),
+      fileSize: toInt(raw['fileSize']),
     );
+  }
+
+  @override
+  void dispose() {
+    _assetsStreamController.close();
+    super.dispose();
   }
 }
 
 final albumControllerProvider =
     StateNotifierProvider<AlbumController, AlbumState>((ref) {
-  return AlbumController(ref.read(mediaChannelProvider));
+  return AlbumController(
+    ref.read(mediaChannelProvider),
+    ref.read(thumbnailCacheProvider),
+  );
 });
 
 class BackupRunnerState {

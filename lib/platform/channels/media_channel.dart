@@ -94,4 +94,19 @@ class MediaChannel {
     );
     return ExportTempFileResult.fromMap(result ?? const <String, dynamic>{});
   }
+
+  Future<Uint8List?> getThumbnail({
+    required String assetId,
+    int width = 256,
+    int height = 256,
+  }) {
+    return _channel.invokeMethod<Uint8List>(
+      'getThumbnail',
+      <String, dynamic>{
+        'assetId': assetId,
+        'width': width,
+        'height': height,
+      },
+    );
+  }
 }
