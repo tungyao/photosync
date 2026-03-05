@@ -10,6 +10,7 @@ class BackupJob {
     required this.startTimeMs,
     required this.skipIfRemoteExists,
     required this.concurrency,
+    this.selectedAssetIds,
   });
 
   final String jobId;
@@ -17,4 +18,5 @@ class BackupJob {
   final int startTimeMs;
   final bool skipIfRemoteExists;
   final int concurrency;
+  final Set<String>? selectedAssetIds;
 }

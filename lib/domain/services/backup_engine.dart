@@ -15,30 +15,41 @@ class BackupProgress {
     required this.done,
     required this.failed,
     required this.skipped,
+    required this.bytesUploaded,
     required this.currentAssetId,
+    this.lastUploadedAssetId,
   });
 
   final int total;
   final int done;
   final int failed;
   final int skipped;
+  final int bytesUploaded;
   final String? currentAssetId;
+  final String? lastUploadedAssetId;
 
   BackupProgress copyWith({
     int? total,
     int? done,
     int? failed,
     int? skipped,
+    int? bytesUploaded,
     String? currentAssetId,
+    String? lastUploadedAssetId,
     bool clearCurrentAssetId = false,
+    bool clearLastUploadedAssetId = false,
   }) {
     return BackupProgress(
       total: total ?? this.total,
       done: done ?? this.done,
       failed: failed ?? this.failed,
       skipped: skipped ?? this.skipped,
+      bytesUploaded: bytesUploaded ?? this.bytesUploaded,
       currentAssetId:
           clearCurrentAssetId ? null : (currentAssetId ?? this.currentAssetId),
+      lastUploadedAssetId: clearLastUploadedAssetId
+          ? null
+          : (lastUploadedAssetId ?? this.lastUploadedAssetId),
     );
   }
 }
@@ -73,6 +84,7 @@ class BackupEngine {
     done: 0,
     failed: 0,
     skipped: 0,
+    bytesUploaded: 0,
     currentAssetId: null,
   );
 
@@ -93,6 +105,7 @@ class BackupEngine {
       done: 0,
       failed: 0,
       skipped: 0,
+      bytesUploaded: 0,
       currentAssetId: null,
     );
     _emitProgress();
@@ -103,7 +116,10 @@ class BackupEngine {
       if (_cancelled) return;
 
       await _runConcurrentUpload(queue, job);
-      _progress = _progress.copyWith(clearCurrentAssetId: true);
+      _progress = _progress.copyWith(
+        clearCurrentAssetId: true,
+        clearLastUploadedAssetId: true,
+      );
       _emitProgress();
     } finally {
       _running = false;
@@ -166,7 +182,11 @@ class BackupEngine {
       hasMore = page.hasMore;
     }
 
-    return all;
+    final selectedIds = job.selectedAssetIds;
+    if (selectedIds == null || selectedIds.isEmpty) {
+      return all;
+    }
+    return all.where((asset) => selectedIds.contains(asset.id)).toList(growable: false);
   }
 
   Future<List<MediaAsset>> _buildUploadQueue(
@@ -190,6 +210,7 @@ class BackupEngine {
         _progress = _progress.copyWith(
           skipped: _progress.skipped + 1,
           currentAssetId: asset.id,
+          clearLastUploadedAssetId: true,
         );
         _emitProgress();
       } else {
@@ -231,7 +252,10 @@ class BackupEngine {
               remotePath: remotePath,
             );
             if (remoteExists) {
-              _progress = _progress.copyWith(skipped: _progress.skipped + 1);
+              _progress = _progress.copyWith(
+                skipped: _progress.skipped + 1,
+                clearLastUploadedAssetId: true,
+              );
               _emitProgress();
               continue;
             }
@@ -256,10 +280,19 @@ class BackupEngine {
             ),
           );
 
-          _progress = _progress.copyWith(done: _progress.done + 1);
+          _progress = _progress.copyWith(
+            done: _progress.done + 1,
+            bytesUploaded: _progress.bytesUploaded + exported.fileSize,
+            currentAssetId: asset.id,
+            lastUploadedAssetId: asset.id,
+          );
           _emitProgress();
         } catch (_) {
-          _progress = _progress.copyWith(failed: _progress.failed + 1);
+          _progress = _progress.copyWith(
+            failed: _progress.failed + 1,
+            currentAssetId: asset.id,
+            clearLastUploadedAssetId: true,
+          );
           _emitProgress();
         }
       }

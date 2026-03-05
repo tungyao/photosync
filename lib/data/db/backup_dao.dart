@@ -11,6 +11,25 @@ class BackupDao extends DatabaseAccessor<AppDatabase> with _$BackupDaoMixin {
     return row != null;
   }
 
+  Future<Set<String>> findExistingIds(Iterable<String> assetIds) async {
+    final ids = assetIds.where((id) => id.isNotEmpty).toSet().toList(growable: false);
+    if (ids.isEmpty) return <String>{};
+
+    // Keep IN-clause under SQLite variable limits.
+    const chunkSize = 900;
+    final existing = <String>{};
+
+    for (var i = 0; i < ids.length; i += chunkSize) {
+      final end = (i + chunkSize < ids.length) ? i + chunkSize : ids.length;
+      final chunk = ids.sublist(i, end);
+      final rows = await (select(backupRecords)
+            ..where((tbl) => tbl.assetId.isIn(chunk)))
+          .get();
+      existing.addAll(rows.map((row) => row.assetId));
+    }
+    return existing;
+  }
+
   Future<void> upsert(BackupRecordsCompanion record) {
     return into(backupRecords).insertOnConflictUpdate(record);
   }

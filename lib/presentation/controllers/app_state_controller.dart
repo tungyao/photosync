@@ -25,6 +25,92 @@ const _kUseSmb1 = 'smb.useSMB1';
 const _kConcurrency = 'backup.concurrency';
 const _kSkipRemoteExists = 'backup.skipIfRemoteExists';
 
+enum BackupUiStatus {
+  idle,
+  running,
+  paused,
+  completed,
+  cancelled,
+  failed,
+}
+
+enum SyncTarget {
+  latestOnly,
+  all,
+  selected,
+}
+
+final syncDialogVisibleProvider = StateProvider<bool>((ref) => false);
+final syncTargetProvider = StateProvider<SyncTarget>((ref) => SyncTarget.latestOnly);
+
+class SyncedIdsState {
+  const SyncedIdsState({
+    required this.syncedIds,
+    required this.resolvedIds,
+  });
+
+  final Set<String> syncedIds;
+  final Set<String> resolvedIds;
+
+  SyncedIdsState copyWith({
+    Set<String>? syncedIds,
+    Set<String>? resolvedIds,
+  }) {
+    return SyncedIdsState(
+      syncedIds: syncedIds ?? this.syncedIds,
+      resolvedIds: resolvedIds ?? this.resolvedIds,
+    );
+  }
+}
+
+class SyncedIdsController extends StateNotifier<SyncedIdsState> {
+  SyncedIdsController(this._dao)
+      : super(
+          const SyncedIdsState(
+            syncedIds: <String>{},
+            resolvedIds: <String>{},
+          ),
+        );
+
+  final BackupDao _dao;
+
+  Future<void> resolveForPage(Iterable<String> assetIds) async {
+    final ids = assetIds.where((id) => id.isNotEmpty).toSet();
+    if (ids.isEmpty) return;
+
+    final unresolved = ids.difference(state.resolvedIds);
+    if (unresolved.isEmpty) return;
+
+    final existing = await _dao.findExistingIds(unresolved);
+    state = state.copyWith(
+      syncedIds: {...state.syncedIds, ...existing},
+      resolvedIds: {...state.resolvedIds, ...unresolved},
+    );
+  }
+
+  void markSynced(Iterable<String> ids) {
+    final valid = ids.where((id) => id.isNotEmpty).toSet();
+    if (valid.isEmpty) return;
+    state = state.copyWith(
+      syncedIds: {...state.syncedIds, ...valid},
+      resolvedIds: {...state.resolvedIds, ...valid},
+    );
+  }
+
+  void clear() {
+    state = const SyncedIdsState(syncedIds: <String>{}, resolvedIds: <String>{});
+  }
+}
+
+final syncedIdsControllerProvider =
+    StateNotifierProvider<SyncedIdsController, SyncedIdsState>((ref) {
+  return SyncedIdsController(ref.read(backupDaoProvider));
+});
+
+final syncedIdsProvider = Provider<Set<String>>((ref) {
+  return ref.watch(syncedIdsControllerProvider.select((s) => s.syncedIds));
+});
+
 final backupDaoProvider = Provider<BackupDao>((ref) {
   final db = ref.watch(appDatabaseProvider);
   return db.backupDao;
@@ -193,7 +279,7 @@ final thumbnailCacheProvider = Provider<ThumbnailLruCache>((ref) {
 });
 
 class AlbumController extends StateNotifier<AlbumState> {
-  AlbumController(this._mediaChannel, this._thumbnailCache)
+  AlbumController(this.ref, this._mediaChannel, this._thumbnailCache)
       : super(
           const AlbumState(
             selectedIds: <String>{},
@@ -206,6 +292,7 @@ class AlbumController extends StateNotifier<AlbumState> {
     _assetsStreamController = StreamController<List<MediaAsset>>.broadcast();
   }
 
+  final Ref ref;
   final MediaChannel _mediaChannel;
   final ThumbnailLruCache _thumbnailCache;
   static const int _thumbSize = 256;
@@ -218,6 +305,7 @@ class AlbumController extends StateNotifier<AlbumState> {
 
   Future<void> loadInitial() async {
     final granted = await _mediaChannel.requestPermission();
+    ref.read(syncedIdsControllerProvider.notifier).clear();
     if (!granted) {
       _pages.clear();
       if (!_assetsStreamController.isClosed) {
@@ -300,6 +388,11 @@ class AlbumController extends StateNotifier<AlbumState> {
         if (!_assetsStreamController.isClosed) {
           _assetsStreamController.add(parsed);
         }
+        unawaited(
+          ref
+              .read(syncedIdsControllerProvider.notifier)
+              .resolveForPage(parsed.map((item) => item.id)),
+        );
       }
       _prefetchThumbnails(parsed);
 
@@ -369,6 +462,7 @@ class AlbumController extends StateNotifier<AlbumState> {
 final albumControllerProvider =
     StateNotifierProvider<AlbumController, AlbumState>((ref) {
   return AlbumController(
+    ref,
     ref.read(mediaChannelProvider),
     ref.read(thumbnailCacheProvider),
   );
@@ -382,6 +476,8 @@ class BackupRunnerState {
     required this.isPaused,
     required this.progress,
     required this.failedAssetIds,
+    required this.speedBytesPerSec,
+    required this.status,
     this.error,
   });
 
@@ -391,6 +487,8 @@ class BackupRunnerState {
   final bool isPaused;
   final BackupProgress progress;
   final List<String> failedAssetIds;
+  final double speedBytesPerSec;
+  final BackupUiStatus status;
   final String? error;
 
   BackupRunnerState copyWith({
@@ -400,6 +498,8 @@ class BackupRunnerState {
     bool? isPaused,
     BackupProgress? progress,
     List<String>? failedAssetIds,
+    double? speedBytesPerSec,
+    BackupUiStatus? status,
     String? error,
     bool clearError = false,
   }) {
@@ -410,6 +510,8 @@ class BackupRunnerState {
       isPaused: isPaused ?? this.isPaused,
       progress: progress ?? this.progress,
       failedAssetIds: failedAssetIds ?? this.failedAssetIds,
+      speedBytesPerSec: speedBytesPerSec ?? this.speedBytesPerSec,
+      status: status ?? this.status,
       error: clearError ? null : (error ?? this.error),
     );
   }
@@ -430,15 +532,21 @@ class BackupRunnerController extends StateNotifier<BackupRunnerState> {
               done: 0,
               failed: 0,
               skipped: 0,
+              bytesUploaded: 0,
               currentAssetId: null,
             ),
             failedAssetIds: const <String>[],
+            speedBytesPerSec: 0,
+            status: BackupUiStatus.idle,
           ),
         );
 
   final Ref ref;
   BackupEngine? _engine;
   StreamSubscription<BackupProgress>? _sub;
+  int _speedSampleMs = 0;
+  int _speedSampleBytes = 0;
+  String? _lastRecordedUploadedId;
 
   void setMode(BackupMode mode) {
     state = state.copyWith(mode: mode);
@@ -448,17 +556,30 @@ class BackupRunnerController extends StateNotifier<BackupRunnerState> {
     state = state.copyWith(startTimeMs: date.millisecondsSinceEpoch);
   }
 
-  Future<void> start() async {
+  Future<void> start({BackupMode? mode, Set<String>? selectedIds}) async {
     if (state.isRunning) return;
+
+    final effectiveMode = mode ?? state.mode;
+    final selected = (selectedIds ?? <String>{}).where((id) => id.isNotEmpty).toSet();
+    final useSelected = selected.isNotEmpty;
+
+    _speedSampleMs = DateTime.now().millisecondsSinceEpoch;
+    _speedSampleBytes = 0;
+    _lastRecordedUploadedId = null;
+
     state = state.copyWith(
+      mode: effectiveMode,
       isRunning: true,
       isPaused: false,
       failedAssetIds: <String>[],
+      speedBytesPerSec: 0,
+      status: BackupUiStatus.running,
       progress: const BackupProgress(
         total: 0,
         done: 0,
         failed: 0,
         skipped: 0,
+        bytesUploaded: 0,
         currentAssetId: null,
       ),
       clearError: true,
@@ -480,39 +601,78 @@ class BackupRunnerController extends StateNotifier<BackupRunnerState> {
       if (p.failed > state.progress.failed && p.currentAssetId != null) {
         failedIds.add(p.currentAssetId!);
       }
-      state = state.copyWith(progress: p, failedAssetIds: failedIds);
+
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final dt = nowMs - _speedSampleMs;
+      final deltaBytes = p.bytesUploaded - _speedSampleBytes;
+      final speed = dt <= 0
+          ? state.speedBytesPerSec
+          : (deltaBytes * 1000 / dt)
+              .toDouble()
+              .clamp(0, double.infinity)
+              .toDouble();
+
+      _speedSampleMs = nowMs;
+      _speedSampleBytes = p.bytesUploaded;
+
+      if (p.lastUploadedAssetId != null &&
+          p.lastUploadedAssetId != _lastRecordedUploadedId) {
+        _lastRecordedUploadedId = p.lastUploadedAssetId;
+        ref
+            .read(syncedIdsControllerProvider.notifier)
+            .markSynced({p.lastUploadedAssetId!});
+      }
+
+      state = state.copyWith(
+        progress: p,
+        failedAssetIds: failedIds,
+        speedBytesPerSec: speed,
+      );
     });
 
     try {
       await _engine!.start(
         BackupJob(
           jobId: DateTime.now().millisecondsSinceEpoch.toString(),
-          mode: state.mode,
-          startTimeMs: state.startTimeMs,
+          mode: effectiveMode,
+          startTimeMs: useSelected ? 0 : state.startTimeMs,
           skipIfRemoteExists: settings.skipIfRemoteExists,
           concurrency: settings.concurrency,
+          selectedAssetIds: useSelected ? selected : null,
         ),
       );
+
+      if (state.status != BackupUiStatus.cancelled) {
+        state = state.copyWith(status: BackupUiStatus.completed);
+      }
     } catch (e) {
-      state = state.copyWith(error: e.toString());
+      state = state.copyWith(error: e.toString(), status: BackupUiStatus.failed);
     } finally {
       state = state.copyWith(isRunning: false, isPaused: false);
     }
   }
 
+  Future<void> retryFailed() {
+    return start(mode: BackupMode.all, selectedIds: state.failedAssetIds.toSet());
+  }
+
   void pause() {
     _engine?.pause();
-    state = state.copyWith(isPaused: true);
+    state = state.copyWith(isPaused: true, status: BackupUiStatus.paused);
   }
 
   void resume() {
     _engine?.resume();
-    state = state.copyWith(isPaused: false);
+    state = state.copyWith(isPaused: false, status: BackupUiStatus.running);
   }
 
   void cancel() {
     _engine?.cancel();
-    state = state.copyWith(isRunning: false, isPaused: false);
+    state = state.copyWith(
+      isRunning: false,
+      isPaused: false,
+      status: BackupUiStatus.cancelled,
+    );
   }
 
   @override

@@ -19,7 +19,7 @@ class PhotoSyncApp extends StatelessWidget {
         useMaterial3: true,
         colorSchemeSeed: Colors.teal,
       ),
-      initialRoute: AppRoutes.home,
+      initialRoute: AppRoutes.album,
       routes: {
         AppRoutes.home: (_) => const HomePage(),
         AppRoutes.smbSetup: (_) => const SmbSetupPage(),
